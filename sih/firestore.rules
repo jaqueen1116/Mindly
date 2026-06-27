@@ -1,0 +1,324 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Checks ownership on existing document reads/updates/deletes
+    function isOwner() {
+      return isSignedIn() && request.auth.uid == resource.data.userId;
+    }
+
+    // Checks ownership on creates (use request.resource because resource doesn't exist yet)
+    function isOwnerOnCreate() {
+      return isSignedIn() && request.auth.uid == request.resource.data.userId;
+    }
+
+    // Helper to allow only specific fields to change on update
+    function onlyFieldsChanged(allowed) {
+      return request.resource.data.diff(resource.data).changedKeys().hasOnly(allowed);
+    }
+
+    // Helper to enforce boolean flip from false->true on a field
+    function flippedFalseToTrue(field) {
+      return resource.data[field] == false && request.resource.data[field] == true;
+    }
+
+    // Helper: admin role check from users collection
+    function isAdmin() {
+      return isSignedIn() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin';
+    }
+
+    // Helper: student role check
+    function isStudent() {
+      return isSignedIn() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'student';
+    }
+
+    // Helper: check if any of the provided fields are being changed in this update
+    function isChangingAny(fields) {
+      return request.resource.data.diff(resource.data).changedKeys().hasAny(fields);
+    }
+
+    // USERS collection: doc id should equal the user's uid
+    match /users/{userId} {
+      allow read: if isSignedIn() && request.auth.uid == userId;
+      allow create: if isSignedIn() && request.auth.uid == request.resource.id;
+      allow update, delete: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Public RESOURCES catalog: readable by anyone, write-restricted (adjust as needed)
+    match /resources/{docId} {
+      allow read: if true;
+      allow write: if false; // Change to role-based check if you add admin roles
+    }
+
+    // Per-user collections: users can only access their own docs
+    match /journal_entries/{docId} {
+      allow create: if isOwnerOnCreate();
+      allow read, update, delete: if isOwner();
+    }
+
+    match /chat_sessions/{docId} {
+      allow create: if isOwnerOnCreate();
+      allow read, update, delete: if isOwner();
+    }
+
+    match /chat_messages/{docId} {
+      allow create: if isOwnerOnCreate();
+      allow read, update, delete: if isOwner();
+    }
+
+    match /assessments/{docId} {
+      allow create: if isOwnerOnCreate();
+      allow read, update, delete: if isOwner();
+    }
+
+    match /appointments/{docId} {
+      // Student creates appointment: require studentId == uid
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.studentId;
+      // Read allowed for the student or the assigned counsellor
+      allow read: if isSignedIn() && (
+        request.auth.uid == resource.data.studentId || request.auth.uid == resource.data.counsellorId
+      );
+      // Updates/deletes only by student for now (adjust if adding staff workflows)
+      allow update, delete: if isSignedIn() && request.auth.uid == resource.data.studentId;
+    }
+
+    match /notifications/{docId} {
+      allow create: if isOwnerOnCreate();
+      allow read, update, delete: if isOwner();
+    }
+
+    match /mood_scores/{docId} {
+      allow create: if isOwnerOnCreate();
+      allow read, update, delete: if isOwner();
+    }
+
+    match /resources_viewed/{docId} {
+      allow create: if isOwnerOnCreate();
+      allow read, update, delete: if isOwner();
+    }
+
+    // Journal entries (flat collection version used by app): only students can access their own
+    match /journal_entries/{entryId} {
+      allow create: if isStudent() && request.auth.uid == request.resource.data.userId;
+      allow read, update, delete: if isStudent() && request.auth.uid == resource.data.userId;
+    }
+
+    // Optional nested path (future migration): journals/{userId}/entries/{entryId}
+    match /journals/{userId}/entries/{entryId} {
+      allow create: if isStudent() && request.auth.uid == userId;
+      allow read, update, delete: if isStudent() && request.auth.uid == userId;
+    }
+
+    // Students collection: per-user demographics separate from users auth basics
+    match /students/{studentId} {
+      // Create allowed only by the owner (userId == uid on create)
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.userId;
+      // Read/update/delete allowed only by the owner of the document
+      allow read, update, delete: if isSignedIn() && request.auth.uid == resource.data.userId;
+    }
+
+    // Forum: public read, signed-in create with ownership, controlled likes updates
+    match /forum_posts/{postId} {
+      // Anyone can read posts
+      allow read: if true;
+      // Only signed-in users can create posts, and they must set userId to their uid
+      allow create: if isOwnerOnCreate();
+      // Updates allowed for:
+      //  - Owner: full update/delete
+      //  - Any signed-in user: may update only likes and likedBy fields (for like/unlike)
+      allow update: if isOwner() || (isSignedIn() && onlyFieldsChanged(["likes", "likedBy"]));
+      allow delete: if isOwner();
+      
+      // Comments subcollection
+      match /comments/{commentId} {
+        allow read: if true; // Anyone can read comments
+        allow create: if isOwnerOnCreate(); // Signed-in with userId == uid
+        // Allow updates/deletes by owner of the comment
+        allow update, delete: if isOwner();
+      }
+    }
+
+    // Counsellors and availability (public read)
+    match /counsellors/{counsellorId} {
+      // Read profiles publicly
+      allow read: if true;
+      // Allow a counsellor to create/update their own profile document
+      // Expect the profile doc to include userId == uid
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.userId;
+      // Owner can update their profile but NOT the 'active' field
+      // Admin can update restricted fields like 'active' for approvals
+      allow update: if (
+        isSignedIn() && request.auth.uid == resource.data.userId && !isChangingAny(["active"])
+      ) || (
+        isAdmin() && onlyFieldsChanged(["active"]) // admin may toggle active only
+      );
+      // Block delete by default (replace with admin check if needed)
+      allow delete: if false;
+
+      // Availability: /counsellors/{id}/availability/{YYYY-MM-DD}/slots/{HH:mm}
+      match /availability/{date}/slots/{time} {
+        // Read availability publicly for listing
+        allow read: if true;
+        // Allow the owner counsellor to CREATE their slot docs with limited keys
+        allow create: if isSignedIn() &&
+          get(/databases/$(database)/documents/counsellors/$(counsellorId)).data.userId == request.auth.uid &&
+          request.resource.data.keys().hasOnly(["time", "booked", "active", "updatedAt"]) &&
+          request.resource.data.time == time &&
+          request.resource.data.booked == false;
+        // Allow booking by students: only allow flipping booked from false -> true and set bookedBy to current user,
+        // and optionally sessionId/updatedAt. Prevent all other changes by non-staff.
+        allow update: if (
+          isSignedIn() && flippedFalseToTrue('booked') &&
+          onlyFieldsChanged(["booked", "bookedBy", "sessionId", "updatedAt"]) &&
+          request.resource.data.bookedBy == request.auth.uid
+        ) || (
+          // Allow the owner counsellor to manage slot fields like 'active' and 'updatedAt'
+          isSignedIn() &&
+          get(/databases/$(database)/documents/counsellors/$(counsellorId)).data.userId == request.auth.uid &&
+          onlyFieldsChanged(["active", "updatedAt"]) // counsellor cannot alter booking fields via this path
+        );
+        // Allow delete if owner counsellor and slot is not booked
+        allow delete: if isSignedIn() &&
+          get(/databases/$(database)/documents/counsellors/$(counsellorId)).data.userId == request.auth.uid &&
+          resource.data.booked == false;
+      }
+    }
+
+    // Counsellor-managed resources collection
+    match /resources_counsellors/{resId} {
+      allow read: if true; // students may read; adjust as needed
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.ownerId;
+      allow update, delete: if isSignedIn() && request.auth.uid == resource.data.ownerId;
+    }
+
+    // ===== CHAT SYSTEM SECURITY RULES =====
+
+    // Anonymous 1:1 Chat - Waiting Queue
+    match /waitingQueue/{userId} {
+      // Allow all authenticated users to read queue entries (needed for matching)
+      allow read: if isSignedIn();
+      // Allow users to create/update their own queue entry, but any authenticated user can delete (for matching cleanup)
+      allow create, update: if isSignedIn() && request.auth.uid == userId;
+      allow delete: if isSignedIn();
+    }
+
+    // Anonymous 1:1 Chat - Matches
+    match /matches/{matchId} {
+      // Only participants in the match can read the match document
+      allow read: if isSignedIn() && request.auth.uid in resource.data.participants;
+      // Any signed-in user can create a match (for system-generated matches)
+      allow create: if isSignedIn();
+      // Only participants can update/end the match
+      allow update: if isSignedIn() && request.auth.uid in resource.data.participants;
+      allow delete: if false; // Matches should not be deleted, only marked inactive
+
+      // Messages within matches
+      match /messages/{messageId} {
+        // Only participants can read messages
+        allow read: if isSignedIn() && request.auth.uid in get(/databases/$(database)/documents/matches/$(matchId)).data.participants;
+        // Only participants can send messages, and senderId must match their uid
+        allow create: if isSignedIn() &&
+          request.auth.uid in get(/databases/$(database)/documents/matches/$(matchId)).data.participants &&
+          request.auth.uid == request.resource.data.senderId;
+        // No updates or deletes allowed for chat messages
+        allow update, delete: if false;
+      }
+
+      // Typing indicators within matches
+      match /typing/{userId} {
+        // Only participants can read typing status
+        allow read: if isSignedIn() && request.auth.uid in get(/databases/$(database)/documents/matches/$(matchId)).data.participants;
+        // Only participants can update their own typing status
+        allow create, update: if isSignedIn() &&
+          request.auth.uid in get(/databases/$(database)/documents/matches/$(matchId)).data.participants &&
+          request.auth.uid == userId;
+        // Allow deletion of typing status
+        allow delete: if isSignedIn() && request.auth.uid == userId;
+      }
+    }
+
+    // Group Chatrooms - Metadata
+    match /chatrooms/{roomId} {
+      // Anyone can read chatroom metadata (public groups)
+      allow read: if true;
+      // Only admins can create/update chatroom metadata
+      allow create, update: if isAdmin();
+      allow delete: if false;
+    }
+
+    // Group Chatrooms - Messages
+    match /chatrooms/{roomId}/messages/{messageId} {
+      // Anyone can read chatroom messages (public groups)
+      allow read: if true;
+      // Only signed-in users can send messages, and senderId must match their uid
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.senderId;
+      // No updates or deletes allowed for chat messages
+      allow update, delete: if false;
+    }
+
+    // User presence tracking
+    match /userPresence/{userId} {
+      // Users can read their own and others' presence
+      allow read: if isSignedIn();
+      // Users can only update their own presence
+      allow create, update: if isSignedIn() && request.auth.uid == userId;
+      allow delete: if isSignedIn() && request.auth.uid == userId;
+    }
+
+    // Volunteers collection
+    match /volunteers/{volunteerId} {
+      // Anyone can read volunteer profiles (for student selection)
+      allow read: if true;
+      // Only volunteers can create their own profile
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.userId;
+      // Only volunteers can update their own profile
+      allow update: if isSignedIn() && request.auth.uid == resource.data.userId;
+      // No deletion allowed
+      allow delete: if false;
+    }
+
+    // Volunteer Chat System
+    match /volunteerChats/{chatId} {
+      // Only the student or volunteer involved can read the chat
+      allow read: if isSignedIn() && (
+        request.auth.uid == resource.data.studentId ||
+        request.auth.uid == resource.data.volunteerId
+      );
+      // Only students can create volunteer chats
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.studentId;
+      // Only participants can update the chat (e.g., end it)
+      allow update: if isSignedIn() && (
+        request.auth.uid == resource.data.studentId ||
+        request.auth.uid == resource.data.volunteerId
+      );
+      allow delete: if false; // Don't allow deletion of chat records
+
+      // Messages within volunteer chats
+      match /messages/{messageId} {
+        // Only participants can read messages
+        allow read: if isSignedIn() && (
+          request.auth.uid == get(/databases/$(database)/documents/volunteerChats/$(chatId)).data.studentId ||
+          request.auth.uid == get(/databases/$(database)/documents/volunteerChats/$(chatId)).data.volunteerId
+        );
+        // Only participants can send messages, and senderId must match their uid
+        allow create: if isSignedIn() &&
+          request.auth.uid == request.resource.data.senderId && (
+            request.auth.uid == get(/databases/$(database)/documents/volunteerChats/$(chatId)).data.studentId ||
+            request.auth.uid == get(/databases/$(database)/documents/volunteerChats/$(chatId)).data.volunteerId
+          );
+        // No updates or deletes allowed for chat messages
+        allow update, delete: if false;
+      }
+    }
+
+    // Peer Management
+    match /peers/{peerId} {
+      // Only the owner can read, create, update, delete their peer entries
+      allow read, update, delete: if isSignedIn() && request.auth.uid == resource.data.userId;
+      allow create: if isSignedIn() && request.auth.uid == request.resource.data.userId;
+    }
+  }
+}

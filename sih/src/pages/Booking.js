@@ -1,0 +1,592 @@
+import React, { useState, useEffect, useMemo } from 'react';
+import { useForm } from 'react-hook-form';
+import { useAuth } from '../contexts/AuthContext';
+import { 
+  subscribeCounsellors,
+  subscribeAvailabilitySlots,
+  bookAppointmentWithSlot,
+  subscribeAppointments
+} from '../firebase/firestore';
+import { 
+  Calendar, 
+  Clock, 
+  User, 
+  MessageCircle, 
+  CheckCircle,
+  AlertCircle,
+  Phone,
+  Video
+} from 'lucide-react';
+import toast from 'react-hot-toast';
+
+const Booking = () => {
+  const { userData } = useAuth();
+  const [selectedDate, setSelectedDate] = useState('');
+  const [selectedTime, setSelectedTime] = useState('');
+  const [selectedCounsellor, setSelectedCounsellor] = useState('');
+  const [selectedType, setSelectedType] = useState('video');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [counsellors, setCounsellors] = useState([]);
+  const [slots, setSlots] = useState([]); // [{time, booked, active, ...}]
+  const [myAppointments, setMyAppointments] = useState([]);
+  const { register, handleSubmit, formState: { errors }, setValue } = useForm();
+
+  // Subscribe to counsellors
+  useEffect(() => {
+    const unsub = subscribeCounsellors(
+      (list) => {
+        // Show only active counsellors
+        const activeList = list.filter(c => c.active === true);
+        setCounsellors(activeList);
+        // If previously selected counsellor no longer exists, clear selection
+        if (selectedCounsellor && !activeList.some(c => c.id === selectedCounsellor)) {
+          setSelectedCounsellor('');
+          setSelectedTime('');
+        }
+      },
+      (err) => {
+        console.error('Failed to load counsellors', err);
+        toast.error('Failed to load counsellors');
+      },
+      100
+    );
+    return () => unsub && unsub();
+  }, []);
+
+  // Resolve the document id to use for availability (counsellor doc id or userId fallback)
+  const availabilityOwnerId = useMemo(() => {
+    const c = counsellors.find(c => c.id === selectedCounsellor);
+    // Prefer a dedicated availabilityId if present, then userId, else the doc id
+    return c?.availabilityId || c?.userId || c?.id || '';
+  }, [counsellors, selectedCounsellor]);
+
+  // Subscribe to availability slots whenever counsellor/date changes
+  useEffect(() => {
+    let unsub;
+    if (availabilityOwnerId && selectedDate) {
+      // Debug logs to verify the path and incoming data
+      try {
+        const parts = selectedDate.split('-');
+        const alt = parts.length === 3
+          ? (parts[0].length === 4
+              ? `${parts[2]}-${parts[1]}-${parts[0]}`
+              : `${parts[2]}-${parts[1]}-${parts[0]}`)
+          : selectedDate;
+        // eslint-disable-next-line no-console
+        console.log('[Booking] Subscribe availability', {
+          availabilityOwnerId,
+          selectedDate,
+          altDateKey: alt,
+        });
+      } catch {}
+      unsub = subscribeAvailabilitySlots(
+        availabilityOwnerId,
+        selectedDate,
+        (items) => {
+          // eslint-disable-next-line no-console
+          console.log('[Booking] availability items', items);
+          setSlots(items);
+          // If selectedTime got booked elsewhere, clear it
+          if (selectedTime && items.some(s => s.time === selectedTime && s.booked)) {
+            setSelectedTime('');
+            toast.error('Selected slot was just booked. Please choose another.');
+          }
+        },
+        (err) => {
+          console.error('Failed to load availability', err);
+          toast.error('Failed to load availability');
+        }
+      );
+    } else {
+      setSlots([]);
+    }
+    return () => unsub && unsub();
+  }, [availabilityOwnerId, selectedDate]);
+
+  // Subscribe to student's booked appointments
+  useEffect(() => {
+    if (!userData?.uid) return;
+    const unsub = subscribeAppointments(
+      { studentId: userData.uid },
+      (items) => {
+        // Show upcoming first, then past; keep simple ascending by date as backend provides
+        setMyAppointments(items);
+      },
+      (err) => {
+        // eslint-disable-next-line no-console
+        console.error('Failed to load your appointments', err);
+      }
+    );
+    return () => unsub && unsub();
+  }, [userData?.uid]);
+
+  const sessionTypes = [
+    {
+      id: 'video',
+      name: 'Video Call',
+      description: 'Secure video session via our platform',
+      icon: Video,
+      duration: '50 minutes'
+    },
+    {
+      id: 'phone',
+      name: 'Phone Call',
+      description: 'Audio-only session for privacy',
+      icon: Phone,
+      duration: '50 minutes'
+    },
+    {
+      id: 'in-person',
+      name: 'In-Person',
+      description: 'Face-to-face session at counseling center',
+      icon: User,
+      duration: '50 minutes'
+    }
+  ];
+
+  // Helpers
+  const sessionTypeLabel = (id) => {
+    const m = sessionTypes.find(t => t.id === id);
+    return m ? m.name : (id ? String(id).replace('-', ' ') : 'Session');
+  };
+
+  const computeApptStatus = (appt) => {
+    const raw = (appt.status || '').toLowerCase();
+    if (raw === 'cancelled' || raw === 'canceled') return 'canceled';
+    // Build a comparable Date from appointmentDate 'YYYY-MM-DD' and time 'HH:mm'
+    try {
+      const dateStr = String(appt.appointmentDate || '');
+      const timeStr = String(appt.appointmentTime || '00:00');
+      const [h, m] = timeStr.split(':').map(x => parseInt(x, 10));
+      const d = new Date(dateStr);
+      if (!Number.isNaN(h) && !Number.isNaN(m)) d.setHours(h, m, 0, 0);
+      return d.getTime() >= Date.now() ? 'upcoming' : 'completed';
+    } catch {
+      return 'upcoming';
+    }
+  };
+
+  const getAvailableSlots = () => {
+    if (!availabilityOwnerId || !selectedDate) return [];
+    return slots
+      .filter(s => (s.active !== false) && !s.booked)
+      .map(s => s.time)
+      .sort((a,b)=>a.localeCompare(b));
+  };
+
+  const onSubmit = async (data) => {
+    if (!selectedDate || !selectedTime || !selectedCounsellor) {
+      toast.error('Please select date, time, and counsellor');
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const counsellor = counsellors.find(c => c.id === selectedCounsellor);
+      // Normalize date key to YYYY-MM-DD
+      const dateKey = new Date(selectedDate).toISOString().split('T')[0];
+      const result = await bookAppointmentWithSlot({
+        user: {
+          uid: userData.uid,
+          displayName: userData.displayName,
+          email: userData.email
+        },
+        counsellorId: selectedCounsellor,
+        counsellorName: counsellor?.name,
+        dateKey, // normalized YYYY-MM-DD
+        time: selectedTime,
+        sessionType: selectedType,
+        reason: data.reason,
+        urgency: data.urgency,
+        previousCounseling: data.previousCounseling,
+        notes: data.notes,
+        slotOwnerId: availabilityOwnerId
+      });
+      if (result.success) {
+        toast.success('Appointment booked successfully! You will receive a confirmation email shortly.');
+        // Reset form
+        setSelectedDate('');
+        setSelectedTime('');
+        setSelectedCounsellor('');
+        setSelectedType('video');
+      } else {
+        toast.error(result.error || 'Failed to book appointment. Please try again.');
+      }
+    } catch (error) {
+      console.error('Error booking appointment:', error);
+      toast.error('An unexpected error occurred');
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="max-w-4xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+      <div className="mb-8">
+        <h1 className="text-3xl font-bold text-gray-900 mb-2">Book a Counseling Session</h1>
+        <p className="text-gray-600">
+          Schedule a confidential session with one of our qualified mental health professionals.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+        {/* Booking Form */}
+        <div className="lg:col-span-2">
+          <div className="card">
+            <h2 className="text-xl font-semibold text-gray-900 mb-6">Session Details</h2>
+            
+            <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+              {/* Session Type */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-3">
+                  Session Type
+                </label>
+                <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                  {sessionTypes.map((type) => {
+                    const Icon = type.icon;
+                    return (
+                      <button
+                        key={type.id}
+                        type="button"
+                        onClick={() => setSelectedType(type.id)}
+                        className={`p-4 border-2 rounded-lg text-left transition-colors ${
+                          selectedType === type.id
+                            ? 'border-primary-500 bg-primary-50'
+                            : 'border-gray-200 hover:border-gray-300'
+                        }`}
+                      >
+                        <div className="flex items-center space-x-3">
+                          <Icon className="w-5 h-5 text-primary-600" />
+                          <div>
+                            <p className="font-medium text-gray-900">{type.name}</p>
+                            <p className="text-sm text-gray-600">{type.description}</p>
+                            <p className="text-xs text-gray-500">{type.duration}</p>
+                          </div>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Counsellor Selection (cards) */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-3">
+                  Select a Counsellor
+                </label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  {counsellors.map((counsellor) => {
+                    const isSelected = selectedCounsellor === counsellor.id;
+                    const rating = Number(counsellor.rating || 0);
+                    const clamped = Math.max(0, Math.min(5, rating));
+                    const fullStars = Math.floor(clamped);
+                    const hasHalf = clamped - fullStars >= 0.5;
+                    const emptyStars = 5 - fullStars - (hasHalf ? 1 : 0);
+                    const exp = counsellor.experience;
+                    const expText = exp
+                      ? (/year/i.test(String(exp)) ? String(exp) : `${exp} years experience`)
+                      : null;
+                    return (
+                      <div
+                        key={counsellor.id}
+                        className={`p-4 border-2 rounded-xl transition-all ${
+                          isSelected ? 'border-primary-500 bg-primary-50 shadow' : 'border-gray-200 hover:border-gray-300'
+                        }`}
+                      >
+                        <div className="flex items-start justify-between gap-3">
+                          <div className="min-w-0">
+                            <h3 className="font-semibold text-gray-900 truncate">{counsellor.name}</h3>
+                            <p className="text-sm text-gray-600 truncate">{counsellor.specialization || 'General Counselling'}</p>
+                            {expText && (
+                              <p className="text-xs text-gray-500 mt-1">{expText}</p>
+                            )}
+                          </div>
+                          {isSelected && (
+                            <span className="text-xs font-medium px-2 py-1 rounded bg-primary-100 text-primary-700 border border-primary-200">Selected</span>
+                          )}
+                        </div>
+
+                        <div className="mt-3 flex items-center justify-between">
+                          <div className="flex items-center gap-1 text-yellow-500">
+                            {Array.from({ length: fullStars }).map((_, i) => (
+                              <span key={`full-${i}`}>★</span>
+                            ))}
+                            {hasHalf && <span>☆</span>}
+                            {Array.from({ length: emptyStars }).map((_, i) => (
+                              <span key={`empty-${i}`}>☆</span>
+                            ))}
+                            <span className="ml-1 text-xs text-gray-600">{clamped.toFixed(1)}</span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => setSelectedCounsellor(counsellor.id)}
+                            className={`px-3 py-1.5 text-sm rounded-md border transition-colors ${
+                              isSelected
+                                ? 'bg-primary-600 text-white border-primary-600'
+                                : 'bg-white text-primary-700 border-primary-300 hover:bg-primary-50'
+                            }`}
+                            aria-pressed={isSelected}
+                          >
+                            {isSelected ? 'Selected' : 'Select'}
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+                {counsellors.length === 0 && (
+                  <div className="text-sm text-gray-500">No counsellors available at the moment. Please check back later.</div>
+                )}
+              </div>
+
+              {/* Date Selection */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Select Date
+                </label>
+                <input
+                  type="date"
+                  value={selectedDate}
+                  onChange={(e) => setSelectedDate(e.target.value)}
+                  min={new Date().toISOString().split('T')[0]}
+                  className="input-field"
+                  required
+                />
+              </div>
+
+              {/* Time Selection (real-time slots) */}
+              {selectedDate && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Select Time
+                  </label>
+                  {getAvailableSlots().length > 0 ? (
+                    <select
+                      value={selectedTime}
+                      onChange={(e) => setSelectedTime(e.target.value)}
+                      className="input-field"
+                    >
+                      <option value="">Select a time</option>
+                      {getAvailableSlots().map((time) => (
+                        <option key={time} value={time}>{time}</option>
+                      ))}
+                    </select>
+                  ) : (
+                    <div className="text-sm text-gray-500 py-2">No available slots for this date.</div>
+                  )}
+                </div>
+              )}
+
+              {/* Reason for Session */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Reason for Session
+                </label>
+                <select
+                  {...register('reason', { required: 'Please select a reason' })}
+                  className="input-field"
+                >
+                  <option value="">Select a reason</option>
+                  <option value="anxiety">Anxiety & Stress</option>
+                  <option value="depression">Depression & Mood</option>
+                  <option value="academic">Academic Stress</option>
+                  <option value="relationships">Relationship Issues</option>
+                  <option value="career">Career Guidance</option>
+                  <option value="other">Other</option>
+                </select>
+                {errors.reason && (
+                  <p className="mt-1 text-sm text-red-600">{errors.reason.message}</p>
+                )}
+              </div>
+
+              {/* Urgency Level */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Urgency Level
+                </label>
+                <select
+                  {...register('urgency', { required: 'Please select urgency level' })}
+                  className="input-field"
+                >
+                  <option value="">Select urgency</option>
+                  <option value="low">Low - Can wait a few days</option>
+                  <option value="medium">Medium - Would like to meet soon</option>
+                  <option value="high">High - Need to meet this week</option>
+                </select>
+                {errors.urgency && (
+                  <p className="mt-1 text-sm text-red-600">{errors.urgency.message}</p>
+                )}
+              </div>
+
+              {/* Previous Counseling */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Have you received counseling before?
+                </label>
+                <select
+                  {...register('previousCounseling', { required: 'Please select an option' })}
+                  className="input-field"
+                >
+                  <option value="">Select an option</option>
+                  <option value="yes">Yes, I have received counseling before</option>
+                  <option value="no">No, this is my first time</option>
+                </select>
+                {errors.previousCounseling && (
+                  <p className="mt-1 text-sm text-red-600">{errors.previousCounseling.message}</p>
+                )}
+              </div>
+
+              {/* Additional Notes */}
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Additional Notes (Optional)
+                </label>
+                <textarea
+                  {...register('notes')}
+                  rows={3}
+                  className="input-field"
+                  placeholder="Any additional information you'd like to share..."
+                />
+              </div>
+
+              {/* Submit Button */}
+              <button
+                type="submit"
+                disabled={isSubmitting || !selectedDate || !selectedTime || !selectedCounsellor}
+                className="w-full btn-primary disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isSubmitting ? 'Booking...' : 'Book Appointment'}
+              </button>
+            </form>
+          </div>
+        </div>
+
+        {/* Booking Summary */}
+        <div className="lg:col-span-1">
+          <div className="card">
+            <h3 className="text-lg font-semibold text-gray-900 mb-4">Booking Summary</h3>
+            
+            {selectedCounsellor && (
+              <div className="space-y-4">
+                <div className="flex items-center space-x-3">
+                  <User className="w-5 h-5 text-gray-400" />
+                  <div>
+                    <p className="text-sm font-medium text-gray-900">
+                      {counsellors.find(c => c.id === selectedCounsellor)?.name}
+                    </p>
+                    <p className="text-xs text-gray-600">
+                      {counsellors.find(c => c.id === selectedCounsellor)?.specialization}
+                    </p>
+                  </div>
+                </div>
+
+                {selectedDate && (
+                  <div className="flex items-center space-x-3">
+                    <Calendar className="w-5 h-5 text-gray-400" />
+                    <div>
+                      <p className="text-sm font-medium text-gray-900">
+                        {new Date(selectedDate).toLocaleDateString('en-US', {
+                          weekday: 'long',
+                          year: 'numeric',
+                          month: 'long',
+                          day: 'numeric'
+                        })}
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {selectedTime && (
+                  <div className="flex items-center space-x-3">
+                    <Clock className="w-5 h-5 text-gray-400" />
+                    <div>
+                      <p className="text-sm font-medium text-gray-900">{selectedTime}</p>
+                      <p className="text-xs text-gray-600">50 minutes</p>
+                    </div>
+                  </div>
+                )}
+
+                <div className="flex items-center space-x-3">
+                  {selectedType === 'video' && <Video className="w-5 h-5 text-gray-400" />}
+                  {selectedType === 'phone' && <Phone className="w-5 h-5 text-gray-400" />}
+                  {selectedType === 'in-person' && <User className="w-5 h-5 text-gray-400" />}
+                  <div>
+                    <p className="text-sm font-medium text-gray-900 capitalize">
+                      {sessionTypes.find(t => t.id === selectedType)?.name}
+                    </p>
+                    <p className="text-xs text-gray-600">
+                      {sessionTypes.find(t => t.id === selectedType)?.description}
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {!selectedCounsellor && (
+              <div className="text-center py-8">
+                <MessageCircle className="w-12 h-12 text-gray-300 mx-auto mb-3" />
+                <p className="text-gray-500 text-sm">
+                  Select a counsellor and time to see your booking summary
+                </p>
+              </div>
+            )}
+          </div>
+
+          {/* Privacy Notice */}
+          <div className="mt-6 card bg-blue-50 border-blue-200">
+            <div className="flex items-start space-x-3">
+              <CheckCircle className="w-5 h-5 text-blue-600 mt-0.5" />
+              <div>
+                <h4 className="font-medium text-blue-900">Privacy & Confidentiality</h4>
+                <p className="text-sm text-blue-700 mt-1">
+                  Your session is completely confidential. Only your assigned counsellor will have access to your information.
+                </p>
+              </div>
+            </div>
+          </div>
+
+          {/* Student's Booked Appointments */}
+          <div className="mt-6 card">
+            <h3 className="text-lg font-semibold text-gray-900 mb-4">Your Booked Appointments</h3>
+            {myAppointments.length === 0 ? (
+              <div className="text-sm text-gray-500">No appointments yet. Book your first session above.</div>
+            ) : (
+              <div className="space-y-3">
+                {myAppointments.map((appt) => {
+                  const counsellor = counsellors.find(c => c.id === appt.counsellorId);
+                  const spec = counsellor?.specialization || 'Counselling';
+                  const status = computeApptStatus(appt);
+                  const statusClass = status === 'completed'
+                    ? 'bg-gray-100 text-gray-700 border-gray-200'
+                    : (status === 'canceled'
+                        ? 'bg-red-100 text-red-700 border-red-200'
+                        : 'bg-green-100 text-green-700 border-green-200');
+                  return (
+                    <div key={appt.id} className="p-3 rounded-lg border border-gray-200">
+                      <div className="flex items-center justify-between">
+                        <div>
+                          <p className="text-sm font-medium text-gray-900">
+                            {new Date(appt.appointmentDate).toLocaleDateString('en-US', {
+                              weekday: 'short', year: 'numeric', month: 'short', day: 'numeric'
+                            })} • {appt.appointmentTime}
+                          </p>
+                          <p className="text-xs text-gray-600">With {appt.counsellorName || counsellor?.name || 'Counsellor'}</p>
+                          <p className="text-xs text-gray-500">{spec} • {sessionTypeLabel(appt.sessionType)}</p>
+                        </div>
+                        <span className={`text-xs px-2 py-1 rounded border capitalize ${statusClass}`}>
+                          {status}
+                        </span>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default Booking;
