@@ -88,7 +88,7 @@ A comprehensive mental health support platform designed specifically for college
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/blueming-hue/sih.git
+   git clone https://github.com/jaqueen1116/sih.git
    cd sih
    ```
 
